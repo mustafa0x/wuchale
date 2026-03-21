@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { dirname } from 'node:path'
+import { dirname, resolve } from 'node:path'
 import { parseArgs } from 'node:util'
 import { type Config, defaultConfigNames, getConfig } from '../config.js'
 import { Hub } from '../hub.js'
@@ -74,7 +74,7 @@ You can specify ${color.cyan('--help')} after a sub-command for more.
 async function configRootLocales(): Promise<[Config, string, string[]]> {
     const config = await getConfig(values.config)
     config.logLevel = values['log-level'] as LogLevel
-    const root = values.config ? dirname(values.config) : process.cwd()
+    const root = resolve(values.config ? dirname(values.config) : process.cwd())
     return [config, root, config.locales]
 }
 

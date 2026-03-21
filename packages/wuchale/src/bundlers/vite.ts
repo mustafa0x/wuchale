@@ -53,10 +53,12 @@ type HotUpdateCtx = {
 }
 
 export const wuchale = (configPath?: string, hmrDelayThreshold = 1000) => {
-    const hub = new Hub(() => getConfig(configPath), dirname(configPath ?? '.'), hmrDelayThreshold)
+    let hub!: Hub
     return {
         name: pluginName,
-        async configResolved(config: { env: { DEV?: boolean } }) {
+        async configResolved(config: { env: { DEV?: boolean }; root?: string }) {
+            const root = config.root ?? dirname(configPath ?? '.')
+            hub = new Hub(() => getConfig(configPath, root), root, hmrDelayThreshold)
             await hub.init(config.env.DEV ? 'dev' : 'build')
         },
         async handleHotUpdate(ctx: HotUpdateCtx) {
@@ -71,15 +73,22 @@ export const wuchale = (configPath?: string, hmrDelayThreshold = 1000) => {
                 }
             }
             if (!changeInfo.sourceTriggered) {
-                ctx.server.ws.send({ type: 'full-reload' })
+                if (changeInfo.invalidate.size > 0) {
+                    ctx.server.ws.send({ type: 'full-reload' })
+                }
                 return []
             }
         },
         transform: {
             order: 'pre' as const,
             async handler(code: string, id: string, options?: { ssr?: boolean | undefined }) {
-                const [output] = await hub.transform(code, trimViteQueries(id), options?.ssr)
-                return output
+                id = trimViteQueries(id)
+                try {
+                    const [output] = await hub.transform(code, id, options?.ssr)
+                    return output
+                } catch (err) {
+                    throw toViteError((err as any).cause ?? err, (err as any).wuchaleAdapterKey ?? pluginName, id)
+                }
             },
         },
     }

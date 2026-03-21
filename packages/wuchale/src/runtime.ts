@@ -50,6 +50,21 @@ function mixedToString(ctx: Mixed, args: any[] = [], start = 1) {
     return msgStr
 }
 
+function toTemplateStrings(ctx: Mixed, args: any[] = []): [TemplateStringsArray, any[]] {
+    const strings = ['']
+    const exprs: any[] = []
+    for (const fragment of ctx) {
+        if (typeof fragment === 'string') {
+            strings[strings.length - 1] += fragment
+            continue
+        }
+        exprs.push(args[fragment])
+        strings.push('')
+    }
+    const cooked = [...strings]
+    return [Object.assign(cooked, { raw: [...strings] }) as TemplateStringsArray, exprs]
+}
+
 export default function toRuntime(mod: CatalogModule = { [catalogVarName]: [] }, locale?: string): Runtime {
     const catalog = mod[catalogVarName]
 
@@ -74,22 +89,7 @@ export default function toRuntime(mod: CatalogModule = { [catalogVarName]: [] },
 
     /** for tagged template strings */
     rt.t = (tag: CallableFunction, id: number, args?: any[]) => {
-        const ctx = getCompositeContext(id) as Mixed
-        const strings: string[] = []
-        const exprs: number[] = []
-        if (typeof ctx[0] === 'number') {
-            strings.push('')
-        }
-        for (const x of ctx) {
-            if (typeof x === 'string') {
-                strings.push(x)
-                continue
-            }
-            exprs.push(args?.[x])
-        }
-        if (typeof ctx.at(-1) === 'number') {
-            strings.push('')
-        }
+        const [strings, exprs] = toTemplateStrings(getCompositeContext(id) as Mixed, args)
         return tag(strings, ...exprs)
     }
 

@@ -1,5 +1,4 @@
 import { dirname, relative, resolve } from 'node:path'
-import { platform } from 'node:process'
 import type { Adapter, GlobConf, LoaderPath } from '../adapters.js'
 import type { CompiledElement } from '../compile.js'
 import type { FS } from '../fs.js'
@@ -20,9 +19,6 @@ export type ManifestEntry = string | string[] | ManifestEntryObj | null
 export const objKeyLocale = (locale: string) => (locale.includes('-') ? `'${locale}'` : locale)
 
 export function normalizeSep(path: string) {
-    if (platform !== 'win32') {
-        return path
-    }
     return path.replaceAll('\\', '/')
 }
 
@@ -76,7 +72,7 @@ export class Files {
     constructor(adapter: Adapter, key: string, localesDir: string, fs: FS, root: string) {
         this.key = key
         this.#adapter = adapter
-        this.#localesDir = localesDir
+        this.#localesDir = resolve(root, localesDir)
         this.#fs = fs
         this.#projectRoot = root
     }
@@ -100,7 +96,7 @@ export class Files {
         return paths
     }
 
-    async getLoaderPath(): Promise<LoaderPath> {
+    async findLoaderPath(): Promise<LoaderPath | undefined> {
         const paths = this.getLoaderPaths()
         for (const path of paths) {
             let bothExist = true
@@ -115,7 +111,10 @@ export class Files {
             }
             return path
         }
-        return paths[0]
+    }
+
+    async getLoaderPath(): Promise<LoaderPath> {
+        return (await this.findLoaderPath()) ?? this.getLoaderPaths()[0]
     }
 
     #proxyFileName(sync = false) {
@@ -142,7 +141,7 @@ export class Files {
     getImportPath(filename: string, importer?: string) {
         const relTo = importer ? resolve(this.#projectRoot, importer) : filename
         filename = normalizeSep(relative(dirname(relTo), filename))
-        if (!filename.startsWith('.')) {
+        if (!(filename.startsWith('./') || filename.startsWith('../') || filename.startsWith('/'))) {
             filename = `./${filename}`
         }
         return filename
@@ -160,7 +159,7 @@ export class Files {
             export const loadCatalog = (/** @type {string} */ loadID, /** @type {string} */ locale) => {
                 return /** @type {CatalogMod} */ (/** @type {KeyCatalogs} */ (catalogs[loadID])[locale])${syncImports ? '' : '()'}
             }
-            export const loadIDs = ['${loadIDs.join("', '")}']
+            export const loadIDs = ${JSON.stringify(loadIDs)}
         `
     }
 
@@ -173,7 +172,7 @@ export class Files {
                     `${objKeyLocale(loc)}: () => import('${this.getImportPath(this.getCompiledFilePath(loc, loadIDsImport[i]))}')`,
                 )
             }
-            imports.push(`${id}: {${importsByLocale.join(',')}}`)
+            imports.push(`${JSON.stringify(id)}: {${importsByLocale.join(',')}}`)
         }
         return this.genProxyContent(imports, loadIDs)
     }
@@ -184,13 +183,13 @@ export class Files {
         for (const [il, id] of loadIDs.entries()) {
             const importedByLocale: string[] = []
             for (const [i, loc] of locales.entries()) {
-                const locKey = `_w_c_${id}_${i}_`
+                const locKey = `_w_c_${il}_${i}_`
                 imports.push(
                     `import * as ${locKey} from '${this.getImportPath(this.getCompiledFilePath(loc, loadIDsImport[il]))}'`,
                 )
                 importedByLocale.push(`${objKeyLocale(loc)}: ${locKey}`)
             }
-            object.push(`${id}: {${importedByLocale.join(',')}}`)
+            object.push(`${JSON.stringify(id)}: {${importedByLocale.join(',')}}`)
         }
         return this.genProxyContent(object, loadIDs, imports)
     }
@@ -200,7 +199,7 @@ export class Files {
         await this.#fs.write(this.proxySyncPath, this.genProxySync(locales, loadIDs, loadIDsImport))
     }
 
-    init = async (ownerKey: string) => {
+    init = async (ownerKey: string, sourceLocale: string) => {
         this.ownerKey = ownerKey
         await this.#initPaths()
         if (this.#adapter.defaultLoaderPath == null) {
@@ -220,12 +219,15 @@ export class Files {
                 .replaceAll('${PROXY_SYNC}', `./${generatedDir}/${this.#proxyFileName(true)}`)
                 .replaceAll('${DATA}', `./${dataFileName}`)
                 .replaceAll('${KEY}', this.key)
+                .replaceAll('${SOURCE_LOCALE}', sourceLocale)
             await this.#fs.write(this.loaderPath[side], loaderContent)
         }
     }
 
     writeUrlFiles = async (manifest: URLManifest, fallbackLocale: string) => {
         if (manifest.length === 0) {
+            await this.#fs.remove(this.#urlManifestFname)
+            await this.#fs.remove(this.#urlsFname)
             return
         }
         const urlManifestData = [
@@ -236,7 +238,7 @@ export class Files {
         const urlFileContent = [
             'import {URLMatcher, deLocalizeDefault} from "wuchale/url"',
             `import {locales} from "./${dataFileName}"`,
-            `import manifest from "./${relative(dirname(this.#urlsFname), this.#urlManifestFname)}"`,
+            `import manifest from "${this.getImportPath(this.#urlManifestFname, this.#urlsFname)}"`,
             `export const getLocale = (/** @type {URL} */ url) => deLocalizeDefault(url.pathname, locales)[1] ?? '${fallbackLocale}'`,
             `export const matchUrl = URLMatcher(manifest, locales)`,
         ].join('\n')
@@ -291,7 +293,7 @@ export class Files {
         if (!this.#adapter.outDir) {
             return
         }
-        const fname = resolve(this.#adapter.outDir + '/' + filename)
+        const fname = resolve(this.#projectRoot, this.#adapter.outDir, filename)
         await this.#fs.mkdir(dirname(fname))
         await this.#fs.write(fname, content)
     }

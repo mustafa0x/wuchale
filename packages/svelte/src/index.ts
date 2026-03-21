@@ -53,7 +53,7 @@ export const defaultArgs: SvelteArgs = {
     files: ['src/**/*.svelte', 'src/**/*.svelte.{js,ts}'],
     storage: pofile(),
     patterns: [pluralPattern],
-    heuristic: svelteKitDefaultHeuristic,
+    heuristic: svelteDefaultHeuristic,
     granularLoad: false,
     bundleLoad: false,
     generateLoadID: defaultGenerateLoadID,
@@ -96,8 +96,10 @@ export function getDefaultLoaderPath(loader: LoaderChoice<LoadersAvailable>, bun
     return resolveLoaderPath(loader)
 }
 
-export const adapter = (args: Partial<SvelteArgs> = defaultArgs): Adapter => {
-    const { heuristic, patterns, runtime, loader, ...rest } = deepMergeObjects(args, defaultArgs)
+export const adapter = (args: Partial<SvelteArgs> = {}): Adapter => {
+    const { patterns, runtime, loader, ...rest } = deepMergeObjects(args, defaultArgs)
+    const heuristic =
+        args.heuristic ?? (loader === 'sveltekit' ? svelteKitDefaultHeuristic : svelteDefaultHeuristic)
     return {
         transform: ({ content, filename, index, expr, matchUrl }) => {
             return new SvelteTransformer(

@@ -125,15 +125,18 @@ export default class AIQueue {
             const sourceComp = id.map(i => compileTranslation(i, ''))
             for (const loc of batch.targetLocales) {
                 const translation = outItem[loc]
-                if (translation?.length !== id.length) {
+                let valid = translation?.length === id.length
+                if (valid) {
+                    for (const [i, sou] of sourceComp.entries()) {
+                        if (!isEquivalent(sou, compileTranslation(translation[i], ''))) {
+                            valid = false
+                            break
+                        }
+                    }
+                }
+                if (!valid) {
                     unTranslated.push(item)
                     break
-                }
-                for (const [i, sou] of sourceComp.entries()) {
-                    if (!isEquivalent(sou, compileTranslation(translation[i], ''))) {
-                        unTranslated.push(item)
-                        break
-                    }
                 }
                 item.translations.set(loc, translation)
             }

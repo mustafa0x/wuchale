@@ -24,7 +24,13 @@ export function defaultCollection(store: Record<string, Runtime>): RuntimeCollec
 
 /** Global catalog states registry */
 const states: Record<string, LoaderState> = {}
+let currentLocale: string | undefined
 const emptyRuntime = toRuntime()
+
+function setRuntime(state: LoaderState, loadID: string, catalog: CatalogModule | undefined, locale = currentLocale) {
+    state.catalogs[loadID] = catalog
+    state.collection.set(loadID, toRuntime(catalog, locale))
+}
 
 /**
  * - `key` is a unique identifier for the group
@@ -36,19 +42,37 @@ export function registerLoaders(
     loadIDs: string[],
     collection?: RuntimeCollection,
 ): (fileID: string) => Runtime {
-    states[key] = {
+    const state = {
         load,
         catalogs: Object.fromEntries(loadIDs.map(id => [id])),
         collection: collection ?? defaultCollection({}),
     }
+    states[key] = state
     for (const id of loadIDs) {
-        states[key].collection.set(id, emptyRuntime)
+        state.collection.set(id, currentLocale ? toRuntime(undefined, currentLocale) : emptyRuntime)
+    }
+    if (currentLocale) {
+        for (const loadID of loadIDs) {
+            const locale = currentLocale
+            const loaded = state.load(loadID, locale)
+            if (loaded instanceof Promise) {
+                void loaded.then(catalog => {
+                    if (currentLocale !== locale) {
+                        return
+                    }
+                    setRuntime(state, loadID, catalog, locale)
+                })
+                continue
+            }
+            setRuntime(state, loadID, loaded, locale)
+        }
     }
     return loadID => states[key].collection.get(loadID)
 }
 
 /* Sets the most recently loaded locale as the current one */
 export function commitLocale(locale: string) {
+    currentLocale = locale
     for (const state of Object.values(states)) {
         for (const [loadID, catalog] of Object.entries(state.catalogs)) {
             state.collection.set(loadID, toRuntime(catalog, locale))

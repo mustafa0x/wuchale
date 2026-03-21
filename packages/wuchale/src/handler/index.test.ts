@@ -11,6 +11,7 @@ import { Logger } from '../log.js'
 import { generatedDir } from './files.js'
 import { AdapterHandler } from './index.js'
 import { SharedState } from './state.js'
+import { defaultPluralRule, newItem, type Item, type SaveData } from '../storage.js'
 
 const localesDir = resolve(import.meta.dirname, '../../testing/tmp')
 
@@ -88,4 +89,120 @@ test('Handle messages', async (t: TestContext) => {
     t.assert.strictEqual(updated1, false)
     const [, updated2] = await handler.handleMessages(msgs, 'bar.ts')
     t.assert.strictEqual(updated2, true)
+})
+
+
+function createTestFS() {
+    const files = new Map<string, string>()
+    return {
+        files,
+        fs: {
+            write: (file: string, data: string) => {
+                files.set(file, data)
+            },
+            read: (file: string) => files.get(file) ?? '',
+            mkdir: () => {},
+            exists: (file: string) => files.has(file),
+            remove: (file: string) => {
+                files.delete(file)
+            },
+        },
+    }
+}
+
+function createStorage(initial: SaveData) {
+    let stored = initial
+    return {
+        storage: {
+            key: 'storage',
+            load: async () => stored,
+            save: async (data: SaveData) => {
+                stored = data
+            },
+            files: [],
+        },
+        set: (data: SaveData) => {
+            stored = data
+        },
+    }
+}
+
+function makeSaveData(items: Item[], locales = ['en', 'es']): SaveData {
+    const pluralRules = new Map(locales.map(loc => [loc, defaultPluralRule]))
+    return { items, pluralRules }
+}
+
+function makeItem(text: string, locales = ['en', 'es']): Item {
+    const item = newItem(
+        {
+            id: [text],
+            references: [{ file: 'test.js', refs: [null] }],
+        },
+        locales,
+    )
+    item.translations.set('en', [text])
+    for (const locale of locales) {
+        if (locale !== 'en') {
+            item.translations.set(locale, [])
+        }
+    }
+    return item
+}
+
+async function createTestHandler(
+    data: SaveData,
+    { locales = ['en', 'es'], sourceLocale = 'en' }: { locales?: string[]; sourceLocale?: string } = {},
+) {
+    const testFS = createTestFS()
+    const storage = createStorage(data)
+    const handler = new AdapterHandler(
+        { ...adapter, sourceLocale },
+        'test',
+        { ...conf, locales },
+        'dev',
+        testFS.fs,
+        import.meta.dirname,
+        new Logger('error'),
+    )
+    await handler.init(new SharedState(storage.storage, handler.key, sourceLocale))
+    return { handler, storage, files: testFS.files }
+}
+
+test('Compile clears removed items from catalogs and manifests', async (t: TestContext) => {
+    const hello = makeItem('Hello')
+    const bye = makeItem('Bye')
+    const { handler, files } = await createTestHandler(makeSaveData([hello, bye]))
+    handler.sharedState.catalog.delete('Bye')
+    await handler.compile()
+    const compiledPath = resolve(localesDir, generatedDir, 'test.test.en.compiled.js')
+    const manifestPath = resolve(localesDir, generatedDir, 'test.test.manifest.js')
+    const compiled = trimLines(files.get(compiledPath)) ?? ''
+    t.assert.strictEqual(compiled.includes('export let c = ["Hello"]'), true)
+    t.assert.strictEqual(compiled.includes('Bye'), false)
+    t.assert.strictEqual(
+        trimLines(files.get(manifestPath)),
+        trimLines(
+            `/** @type {(string | {text: string | string[], context?: string, isUrl?: boolean} | null)[]} */
+export const keys = ["Hello",null]`,
+        ),
+    )
+})
+
+test('Load clears removed storage items', async (t: TestContext) => {
+    const hello = makeItem('Hello', ['en'])
+    const bye = makeItem('Bye', ['en'])
+    const { handler, storage } = await createTestHandler(makeSaveData([hello, bye], ['en']), { locales: ['en'] })
+    storage.set(makeSaveData([hello], ['en']))
+    await handler.loadStorage()
+    t.assert.deepStrictEqual([...handler.sharedState.catalog.keys()], ['Hello'])
+})
+
+test('Compile uses source locale even when it is not first', async (t: TestContext) => {
+    const hello = makeItem('Hello')
+    const { files } = await createTestHandler(makeSaveData([hello]), {
+        locales: ['es', 'en'],
+        sourceLocale: 'en',
+    })
+    const compiledPath = resolve(localesDir, generatedDir, 'test.test.es.compiled.js')
+    t.assert.strictEqual((trimLines(files.get(compiledPath)) ?? '').includes('export let c = ["Hello"]'), true)
 })

@@ -94,6 +94,9 @@ export const inMemFS: FS = {
     read: file => inMemFiles.get(file) ?? '',
     mkdir: () => {},
     exists: () => true,
+    remove: file => {
+        inMemFiles.delete(file)
+    },
 }
 
 export const inMemStorage: StorageFactory = () => {

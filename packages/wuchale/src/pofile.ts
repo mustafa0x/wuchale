@@ -1,4 +1,4 @@
-import { mkdir } from 'node:fs/promises'
+import { mkdir, rm } from 'node:fs/promises'
 import { isAbsolute, resolve } from 'node:path'
 import PO from 'pofile'
 import { getKey } from './adapters.js'
@@ -19,6 +19,7 @@ import {
 type POItem = InstanceType<typeof PO.Item>
 
 const urlAdapterFlagPrefix = 'url:'
+const refCommentPrefix = 'wuchale:'
 
 type Additionals = {
     comments: string[]
@@ -26,6 +27,43 @@ type Additionals = {
 }
 
 type AdditionalsByLoc = Map<string, Additionals>
+
+function refEntryToComment(ref: FileRefEntry | null) {
+    if (ref == null) {
+        return ''
+    }
+    return `${refCommentPrefix}${JSON.stringify(ref)}`
+}
+
+function refCommentToEntry(comment: string | undefined, isUrl: boolean): FileRefEntry | null {
+    const comm = comment?.trim()
+    if (!comm) {
+        return null
+    }
+    if (comm.startsWith(refCommentPrefix)) {
+        try {
+            const { link, placeholders = [] } = JSON.parse(comm.slice(refCommentPrefix.length))
+            if (link == null) {
+                return { placeholders }
+            }
+            return { link, placeholders }
+        } catch {
+            // support old format below
+        }
+    }
+    const refEnt: FileRefEntry = { placeholders: [] }
+    const commSp = comm.split('; ')
+    let phStart = 0
+    if (isUrl) {
+        refEnt.link = commSp[0]
+        phStart++
+    }
+    for (const c of commSp.slice(phStart)) {
+        const [i, ph] = c.split(': ', 2)
+        refEnt.placeholders.push([Number(i), ph])
+    }
+    return refEnt.placeholders.length || refEnt.link ? refEnt : null
+}
 
 function itemToPOItem(item: Item, locale: string, sourceLocale: string): POItem {
     const poi = new PO.Item()
@@ -35,23 +73,7 @@ function itemToPOItem(item: Item, locale: string, sourceLocale: string): POItem 
     poi.msgstr = item.translations.get(locale)!
     poi.msgctxt = item.context
     poi.references = item.references.flatMap(r => r.refs.map(_ => r.file))
-    poi.extractedComments = item.references
-        .flatMap(r =>
-            r.refs.map(frEntry => {
-                if (frEntry === null) {
-                    return null
-                }
-                let comm: string[] = []
-                if (frEntry.link) {
-                    comm.push(frEntry.link)
-                }
-                for (const [i, ph] of frEntry.placeholders) {
-                    comm.push(`${i}: ${ph}`)
-                }
-                return comm.join('; ')
-            }),
-        )
-        .filter(c => c !== null)
+    poi.extractedComments = item.references.flatMap(r => r.refs.map(refEntryToComment))
     const additionals: AdditionalsByLoc = (item.additionals as AdditionalsByLoc) ?? new Map()
     poi.comments = additionals.get(locale)?.comments ?? []
     poi.flags = additionals.get(locale)?.flags ?? {}
@@ -85,24 +107,7 @@ function poitemToItemCommons(poi: POItem): Item {
             lastRef = { file: ref, refs: [] }
             references.push(lastRef)
         }
-        const comm = poi.extractedComments[i]?.trim()
-        if (!comm) {
-            lastRef.refs.push(null)
-            continue
-        }
-        const refEnt: FileRefEntry = { placeholders: [] }
-        const commSp = comm.split('; ')
-        let phStart = 0
-        if (urlAdapters.length) {
-            // url
-            refEnt.link = commSp[0]
-            phStart++
-        }
-        for (const c of commSp.slice(phStart)) {
-            const [i, ph] = c.split(': ', 2)
-            refEnt.placeholders.push([Number(i), ph])
-        }
-        lastRef.refs.push(refEnt)
+        lastRef.refs.push(refCommentToEntry(poi.extractedComments[i], urlAdapters.length > 0))
     }
     return {
         id: msgid,
@@ -132,11 +137,11 @@ export class POFile {
     files: string[] = []
 
     constructor(opts: StorageFactoryOpts & POFileOptions) {
-        this.key = opts.dir
         this.opts = opts
         if (!isAbsolute(opts.dir)) {
             opts.dir = resolve(opts.root, opts.dir)
         }
+        this.key = opts.dir
         for (const locale of opts.locales) {
             const locFiles = [resolve(opts.dir, `${locale}.po`), resolve(opts.dir, `${locale}.url.po`)] as [
                 string,
@@ -198,18 +203,24 @@ export class POFile {
         // then merge them
         const items: Item[] = []
         for (const poIs of poItems.values()) {
-            const item = poitemToItemCommons(poIs.get(this.opts.sourceLocale)!)
+            const sourcePoi = poIs.get(this.opts.sourceLocale)
+            const basePoi = sourcePoi ?? poIs.values().next().value
+            if (basePoi == null) {
+                continue
+            }
+            const item = poitemToItemCommons(basePoi)
+            const sourceId = getItemId(basePoi)
             const additionals: AdditionalsByLoc = new Map()
             for (const loc of this.opts.locales) {
                 const poi = poIs.get(loc)
-                item.translations.set(loc, poi?.msgstr ?? [])
+                item.translations.set(loc, loc === this.opts.sourceLocale ? sourceId : poi?.msgstr ?? [])
                 const add: Additionals = {
                     comments: poi?.comments ?? [],
                     flags: {},
                 }
                 for (const [k, v] of Object.entries(poi?.flags ?? {})) {
                     if (!k.startsWith(urlAdapterFlagPrefix)) {
-                        add.flags[k] = v
+                        add.flags[k] = v as boolean | undefined
                     }
                 }
                 additionals.set(loc, add)
@@ -251,8 +262,12 @@ export class POFile {
             }
             const headers = this.getHeaders(locale, data.pluralRules.get(locale)!)
             await this.saveRaw(poItems, headers, locale, false)
-            if (poItemsUrl.length > 0) {
-                await this.saveRaw(poItemsUrl, headers, locale, true)
+            if (this.opts.separateUrls && this.opts.haveUrl) {
+                if (poItemsUrl.length > 0) {
+                    await this.saveRaw(poItemsUrl, headers, locale, true)
+                } else {
+                    await rm(this.filesByLoc.get(locale)![1], { force: true })
+                }
             }
         }
     }

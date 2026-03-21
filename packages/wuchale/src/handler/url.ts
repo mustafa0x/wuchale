@@ -11,18 +11,27 @@ import { compileTranslation, type Mixed } from '../compile.js'
 import { type Catalog, type Item, newItem } from '../storage.js'
 import { type URLManifest } from '../url.js'
 
-export function patternFromTranslate(patternTranslated: string, keys: Token[]) {
+export function patternFromTranslate(patternTranslated: string, keys: Token[], fallback = patternTranslated) {
     const compiledTranslatedPatt = compileTranslation(patternTranslated, patternTranslated)
     if (typeof compiledTranslatedPatt === 'string') {
         return compiledTranslatedPatt
     }
-    const urlTokens: Token[] = (compiledTranslatedPatt as Mixed).map(part => {
-        if (typeof part === 'number') {
-            return keys[part]
+    try {
+        const urlTokens: Token[] = []
+        for (const part of compiledTranslatedPatt as Mixed) {
+            if (typeof part !== 'number') {
+                urlTokens.push({ type: 'text', value: part })
+                continue
+            }
+            if (keys[part] == null) {
+                return fallback
+            }
+            urlTokens.push(keys[part])
         }
-        return { type: 'text', value: part }
-    })
-    return stringify({ tokens: urlTokens })
+        return stringify({ tokens: urlTokens })
+    } catch {
+        return fallback
+    }
 }
 
 export function patternToTranslate(pattern: string) {
@@ -59,7 +68,7 @@ export class URLHandler {
                 const transl = item?.translations?.get(loc)
                 if (transl) {
                     const patternTranslated = transl[0] || item!.translations.get(this.sourceLocale)![0]
-                    pattern = patternFromTranslate(patternTranslated, keys)
+                    pattern = patternFromTranslate(patternTranslated, keys, patt)
                 }
                 locPatterns.push(pattern)
             }
@@ -150,7 +159,7 @@ export class URLHandler {
             patternItem.translations.get(locale)![0] || patternItem.translations.get(this.sourceLocale)![0]
         // e.g. translatedPattern: /elementos/{0}
         const { keys } = pathToRegexp(relevantPattern)
-        const translatedPattUrl = patternFromTranslate(translatedPattern, keys)
+        const translatedPattUrl = patternFromTranslate(translatedPattern, keys, relevantPattern)
         // e.g. translatedPattUrl: /elementos/:rest
         const compileTranslated = compileUrlPattern(translatedPattUrl, { encode: false })
         return compileTranslated(matchedUrl.params)

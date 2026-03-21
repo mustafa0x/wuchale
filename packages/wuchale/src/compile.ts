@@ -102,6 +102,9 @@ function compile(msgStr: string, start = 0, parentTag: number | null = null): [C
         }
         i = newI
     }
+    if (parentTag != null && i >= len) {
+        throw Error('Tag not closed')
+    }
     if (curTxt) {
         compiled.push(curTxt)
     }

@@ -20,6 +20,11 @@ test('Compile messages', t => {
     ])
 })
 
+test('Malformed tags fall back', (t: TestContext) => {
+    const fallback: CompiledElement = ['fallback']
+    t.assert.strictEqual(compileTranslation('A <0>B C', fallback), fallback)
+})
+
 test('Compare compiled equivalent', (t: TestContext) => {
     t.assert.ok(isEquivalent('orig', 'transl'))
     t.assert.ok(isEquivalent(['orig ', 0], ['transl ', 0]))

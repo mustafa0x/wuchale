@@ -1,10 +1,11 @@
-import { mkdir, readFile, statfs, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, rm, statfs, writeFile } from 'node:fs/promises'
 
 export type FS = {
     read(file: string): string | Promise<string>
     write(file: string, content: string): void | Promise<void>
     mkdir(path: string): void | Promise<void>
     exists(path: string): boolean | Promise<boolean>
+    remove(path: string): void | Promise<void>
 }
 
 export const defaultFS: FS = {
@@ -31,10 +32,15 @@ export const defaultFS: FS = {
             return false
         }
     },
+
+    async remove(path: string) {
+        await rm(path, { force: true })
+    },
 }
 
 export const readOnlyFS: FS = {
     ...defaultFS,
     write: () => {},
     mkdir: () => {},
+    remove: () => {},
 }

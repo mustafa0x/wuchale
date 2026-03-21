@@ -20,6 +20,37 @@ const ai: AI = {
 
 const queue = new AIQueue('en', ai, async () => {}, new Logger('error'))
 
+test('Invalid translations are not persisted after retries', async (t: TestContext) => {
+    let calls = 0
+    const badAI: AI = {
+        name: 'bad',
+        batchSize: 1,
+        parallel: 1,
+        group: {},
+        async translate() {
+            calls++
+            return JSON.stringify([{ es: ['Hola'] }])
+        },
+    }
+
+    const item: Item = {
+        id: ['Hello {0}'],
+        translations: new Map([
+            ['en', ['Hello {0}']],
+            ['es', []],
+        ]),
+        references: [],
+        urlAdapters: [],
+    }
+
+    const queue = new AIQueue('en', badAI, async () => {}, new Logger('error'))
+    queue.add([item])
+    await queue.running
+
+    t.assert.equal(calls, 30)
+    t.assert.deepStrictEqual(item.translations.get('es'), [])
+})
+
 test('Translations accepted correctly', async (t: TestContext) => {
     const item: Item = {
         id: ['Welcome'],

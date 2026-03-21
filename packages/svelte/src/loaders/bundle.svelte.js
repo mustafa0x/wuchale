@@ -1,7 +1,7 @@
 import toRuntime from 'wuchale/runtime'
 import { locales } from '${DATA}'
 
-let locale = $state(locales[0])
+let locale = $state('${SOURCE_LOCALE}')
 
 /**
  * @param {import('${DATA}').Locale} newLocale

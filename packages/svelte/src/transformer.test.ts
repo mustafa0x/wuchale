@@ -2,9 +2,10 @@
 
 import { test } from 'node:test'
 import { IndexTracker, type RuntimeConf, URLHandler } from 'wuchale'
+import { compile } from 'svelte/compiler'
 // @ts-expect-error
 import { ts as svelte, transformTest, ts } from '../../wuchale/testing/utils.ts'
-import { defaultArgs } from './index.js'
+import { defaultArgs, svelteKitDefaultHeuristic } from './index.js'
 import { SvelteTransformer } from './transformer.js'
 
 const urlHandler = new URLHandler(['en'], 'en', {
@@ -14,12 +15,12 @@ const urlHandler = new URLHandler(['en'], 'en', {
 
 const catalogExpr = { plain: '_w_load_()', reactive: '_w_load_rx_()' }
 
-const getOutput = (content: string, filename = 'test.svelte') =>
+const getOutput = (content: string, filename = 'test.svelte', heuristic = defaultArgs.heuristic) =>
     new SvelteTransformer(
         content,
         filename,
         new IndexTracker(),
-        defaultArgs.heuristic,
+        heuristic,
         defaultArgs.patterns,
         catalogExpr,
         defaultArgs.runtime as RuntimeConf,
@@ -188,7 +189,8 @@ test('Keep as single unit', async t => {
 test('URLs', async t => {
     transformTest(
         t,
-        await getOutput(svelte`
+        await getOutput(
+            svelte`
         <script>
             goto(\`/translated/\${44}\`)
             const url = {
@@ -202,7 +204,10 @@ test('URLs', async t => {
         <a href={\`/translated/\${44}\`}>Hello</a>
         <a href="/notinpattern">Hello</a>
         <a href="/">Hello</a>
-    `),
+    `,
+            'test.svelte',
+            svelteKitDefaultHeuristic,
+        ),
         svelte`
         <script>
             import { _w_load_, _w_load_rx_ } from "./loader.js"
@@ -356,4 +361,66 @@ test('Nested and mixed', async t => {
     `,
         ['Hello and <0>welcome to <0>the app {0}</0></0>!'],
     )
+})
+
+test('$props defaults stay as top-level $props initializers', async t => {
+    const result = await getOutput(svelte`<script>let { label = 'Hello' } = $props();</script>`)
+    const code = result.output('import { _w_load_, _w_load_rx_ } from "./loader.js"').code
+    t.assert.match(code, /let \{ label = _w_runtime_\(0\) \} = \$props\(\);/)
+    t.assert.doesNotMatch(code, /\$derived\(\$props\(\)\)/)
+    t.assert.doesNotThrow(() => compile(code, { generate: 'client' }))
+    t.assert.deepEqual(result.msgs.map(msg => msg.msgStr), [['Hello']])
+})
+
+test('special Svelte elements extract nested text', async t => {
+    const result = await getOutput(svelte`
+        <slot>Default text</slot>
+        <svelte:component this={Cmp}>Hello</svelte:component>
+        <Card><svelte:fragment slot="header">Welcome</svelte:fragment></Card>
+        <svelte:element this={tag}>There</svelte:element>
+        <svelte:self>Again</svelte:self>
+    `)
+    t.assert.deepEqual(result.msgs.map(msg => msg.msgStr[0]), ['Default text', 'Hello', 'Welcome', 'There', 'Again'])
+})
+
+test('mixed text around special elements keeps nested text', async t => {
+    const result = await getOutput(svelte`<p>Hello <slot>there</slot>!</p>`)
+    t.assert.deepEqual(result.msgs.map(msg => msg.msgStr[0]), ['Hello <0>there</0>!'])
+})
+
+test('directive expressions and html tags are traversed', async t => {
+    const result = await getOutput(svelte`
+        <button on:click={() => alert('Hello')}>Click</button>
+        <div class:active={flag('World')} />
+        {@html renderHtml('From html')}
+    `)
+    t.assert.deepEqual(result.msgs.map(msg => msg.msgStr[0]), ['Hello', 'Click', 'World', 'From html'])
+})
+
+test('directive URL expressions localize with the SvelteKit heuristic', async t => {
+    const result = await getOutput(
+        svelte`<button on:click={() => goto('/translated/hello')}>Go</button>`,
+        'test.svelte',
+        svelteKitDefaultHeuristic,
+    )
+    const code = result.output('import { _w_load_, _w_load_rx_ } from "./loader.js"').code
+    t.assert.deepEqual(
+        result.msgs.map(msg => ({ msgStr: msg.msgStr[0], type: msg.type })),
+        [
+            { msgStr: '/translated/hello', type: 'url' },
+            { msgStr: 'Go', type: 'message' },
+        ],
+    )
+    t.assert.match(code, /goto\(_w_localize_\(_w_runtime_\(0\), _w_runtime_\.l\)\)/)
+})
+
+test('snippet runtime does not switch on string literal matches in module exports', async t => {
+    const result = await getOutput(svelte`
+        <script module>export const unrelated = 'foo';</script>
+        {#snippet foo()}Hello{/snippet}
+    `)
+    const code = result.output('import { _w_load_, _w_load_rx_ } from "./loader.js"').code
+    t.assert.match(code, /\{#snippet foo\(\)\}[\s\S]*_w_runtime_\(0\)/)
+    t.assert.doesNotMatch(code, /\{#snippet foo\(\)\}[\s\S]*_w_runtime_mod_\(0\)/)
+    t.assert.deepEqual(result.msgs.map(msg => msg.msgStr[0]), ['Hello'])
 })

@@ -1,6 +1,8 @@
 // $ node --import ../testing/resolve.ts %f
 
 import { test } from 'node:test'
+import { pathToRegexp } from 'path-to-regexp'
+import { patternFromTranslate } from './handler/url.js'
 import { URLMatcher } from './url.js'
 
 test('URL matcher', t => {
@@ -20,4 +22,10 @@ test('URL matcher', t => {
         altPatterns: { en: '/path', es: '/ruta' },
         params: {},
     })
+})
+
+
+test('patternFromTranslate falls back on invalid placeholder indices', t => {
+    const { keys } = pathToRegexp('/items/:rest')
+    t.assert.strictEqual(patternFromTranslate('/elementos/{1}', keys, '/items/:rest'), '/items/:rest')
 })

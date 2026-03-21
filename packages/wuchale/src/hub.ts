@@ -102,16 +102,16 @@ export class Hub {
     constructor(loadConfig: ConfigLoader, root: string, hmrDelayThreshold = 1000, fs = defaultFS) {
         this.#loadConfig = loadConfig
         this.#fs = fs
-        this.#projectRoot = root
+        this.#projectRoot = resolve(root)
         // threshold to consider po file change is manual edit instead of a sideeffect of editing code
         this.#hmrDelayThreshold = hmrDelayThreshold
     }
 
     async #initGenDirWithData() {
-        await this.#fs.mkdir(resolve(this.#config.localesDir, generatedDir))
+        await this.#fs.mkdir(resolve(this.#projectRoot, this.#config.localesDir, generatedDir))
         // data file
         await this.#fs.write(
-            resolve(this.#config.localesDir, dataFileName),
+            resolve(this.#projectRoot, this.#config.localesDir, dataFileName),
             [
                 `/** @typedef {('${this.#config.locales.join("'|'")}')} Locale */`,
                 `/** @type {Locale[]} */`,
@@ -183,7 +183,7 @@ export class Hub {
                 }
             }
         }
-        this.#confUpdateFile = normalizeSep(resolve(this.#config.localesDir, generatedDir, confUpdateName))
+        this.#confUpdateFile = normalizeSep(resolve(this.#projectRoot, this.#config.localesDir, generatedDir, confUpdateName))
         await this.#fs.write(this.#confUpdateFile, '{}') // only watch changes so prepare first
     }
 
@@ -213,6 +213,7 @@ export class Hub {
     }
 
     onFileChange = async (file: string, read: () => string | Promise<string>): Promise<FileChangeInfo | undefined> => {
+        file = normalizeSep(file)
         if (this.#confUpdateFile === file) {
             const update: ConfUpdate = JSON.parse(await read())
             this.#log.info(`${logPrefix} config update received: ${update}`)
@@ -263,10 +264,7 @@ export class Hub {
     }
 
     transform = async (code: string, filePath: string, forServer = false): ReturnType<AdapterHandler['transform']> => {
-        if (this.#mode === 'dev' && !this.#config.hmr) {
-            return [{}, false]
-        }
-        const filename = relative(this.#projectRoot, filePath)
+        const filename = normalizeSep(relative(this.#projectRoot, filePath))
         let output: [TransformOutputCode, boolean] | null = null
         let lastAdapterKey: string | null = null
         for (const adapter of this.#handlers.values()) {
@@ -276,7 +274,14 @@ export class Hub {
                         `${logPrefix} ${filename} matches both adapters ${lastAdapterKey} and ${adapter.key}`,
                     )
                 }
-                output = await adapter.transform(code, filename, this.#hmrVersion, forServer)
+                try {
+                    output = await adapter.transform(code, filename, this.#hmrVersion, forServer)
+                } catch (err) {
+                    if (err && typeof err === 'object') {
+                        ;(err as Record<string, unknown>).wuchaleAdapterKey ??= adapter.key
+                    }
+                    throw err
+                }
                 lastAdapterKey = adapter.key
             }
         }
@@ -288,6 +293,27 @@ export class Hub {
         const contents = await this.#fs.read(resolve(this.#projectRoot, filename))
         const [, updated] = await handler.transform(contents, filename)
         return updated
+    }
+
+    async #removeDeletedFileRefs(filename: string, clean: boolean) {
+        for (const handler of this.#handlers.values()) {
+            const catalog = handler.sharedState.catalog
+            let updated = false
+            for (const [key, item] of catalog) {
+                const refs = item.references.filter(ref => ref.file !== filename)
+                if (refs.length === item.references.length) {
+                    continue
+                }
+                item.references = refs
+                updated = true
+                if (clean && itemIsObsolete(item)) {
+                    catalog.delete(key)
+                }
+            }
+            if (updated) {
+                await handler.saveStorageCompile()
+            }
+        }
     }
 
     async #directVisitHandler(handler: AdapterHandler, clean: boolean, sync: boolean): Promise<boolean> {
@@ -315,11 +341,17 @@ export class Hub {
             let cleaned = 0
             for (const [key, item] of catalog) {
                 const initRefsN = item.references.length
-                item.references = item.references.filter(
-                    ref =>
-                        handler.fileMatches(ref.file) ||
-                        handler.sharedState.otherFileMatches.some(match => match(ref.file)),
-                )
+                const refs = [] as typeof item.references
+                for (const ref of item.references) {
+                    if (
+                        !(handler.fileMatches(ref.file) || handler.sharedState.otherFileMatches.some(match => match(ref.file))) ||
+                        !(await this.#fs.exists(resolve(this.#projectRoot, ref.file)))
+                    ) {
+                        continue
+                    }
+                    refs.push(ref)
+                }
+                item.references = refs
                 if (item.references.length < initRefsN) {
                     updated = true
                     cleaned++
@@ -334,20 +366,50 @@ export class Hub {
                 this.#log.info(`${logPrefix} Cleaned ${cleaned} items`)
             }
         }
-        if (updated) {
-            await handler.sharedState.save()
-        }
         return updated
+    }
+
+    async handleWatchEvent(event: string, filename: string, clean = false) {
+        filename = normalizeSep(filename)
+        if (event === 'unlink') {
+            await this.#removeDeletedFileRefs(filename, clean)
+            return
+        }
+        if (!['add', 'change'].includes(event)) {
+            return
+        }
+        const id = normalizeSep(resolve(this.#projectRoot, filename))
+        const read = () => this.#fs.read(id)
+        await this.onFileChange(id, read)
+        const [, updated] = await this.transform(await read(), id)
+        if (!updated) {
+            return
+        }
+        for (const handler of this.#handlers.values()) {
+            if (handler.fileMatches(filename)) {
+                await handler.saveStorageCompile()
+                return
+            }
+        }
     }
 
     async directVisit(clean: boolean, watch: boolean, sync: boolean) {
         !watch && this.#log.info('Extracting...')
         const handlers = Array.from(this.#handlers.values())
         // owner adapter handlers should run last for cleanup
-        handlers.sort(h => (h.sharedState.ownerKey === h.key ? 1 : -1))
-        // separate loop to make sure that all otherFileMatchers are collected
+        handlers.sort(
+            (a, b) => Number(a.sharedState.ownerKey === a.key) - Number(b.sharedState.ownerKey === b.key),
+        )
+        const ownerHandlers = new Map(handlers.map(handler => [handler.key, handler]))
+        const updatedOwners = new Set<AdapterHandler>()
         for (const handler of handlers) {
-            await this.#directVisitHandler(handler, clean, sync)
+            if (!(await this.#directVisitHandler(handler, clean, sync))) {
+                continue
+            }
+            updatedOwners.add(ownerHandlers.get(handler.sharedState.ownerKey)!)
+        }
+        for (const handler of updatedOwners) {
+            await handler.saveStorageCompile()
         }
         if (!watch) {
             this.#log.info('Extraction finished.')
@@ -355,14 +417,8 @@ export class Hub {
         }
         // watch
         this.#log.info('Watching for changes')
-        watchFS('.', { ignoreInitial: true }).on('all', async (event, filename) => {
-            if (!['add', 'change'].includes(event)) {
-                return
-            }
-            const id = resolve(this.#projectRoot, filename)
-            const read = () => this.#fs.read(id)
-            await this.onFileChange(id, read)
-            await this.transform(await read(), id)
+        watchFS('.', { cwd: this.#projectRoot, ignoreInitial: true }).on('all', async (event, filename) => {
+            await this.handleWatchEvent(event, filename, clean)
         })
     }
 
@@ -373,7 +429,7 @@ export class Hub {
             const adapStats: TranslStats = { own: true, total: 0, url: 0, details: [] }
             statuses.push({
                 key,
-                loaders: await handler.files.getLoaderPath(),
+                loaders: await handler.files.findLoaderPath(),
                 storage: state.ownerKey === key ? adapStats : { own: false, ownerKey: state.ownerKey },
             })
             if (state.ownerKey !== key) {

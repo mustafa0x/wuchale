@@ -16,7 +16,17 @@ import { getKey } from 'wuchale'
 import { MixedVisitor, nonWhitespaceText, varNames } from 'wuchale/adapter-utils'
 import { parseScript, Transformer } from 'wuchale/adapter-vanilla'
 
-const nodesWithChildren = ['RegularElement', 'Component']
+const nodesWithChildren = [
+    'RegularElement',
+    'Component',
+    'SlotElement',
+    'SvelteComponent',
+    'SvelteFragment',
+    'SvelteSelf',
+    'SvelteElement',
+    'SvelteBoundary',
+    'TitleElement',
+]
 const noWrapTopCalls = ['$props', '$state', '$derived', '$effect']
 
 const rtComponent = 'W_tx_'
@@ -43,7 +53,8 @@ export class SvelteTransformer extends Transformer<RuntimeCtxSv> {
     currentElement?: string
     inCompoundText: boolean = false
     currentSnippet: number = 0
-    moduleExportRanges: [number, number][] = [] // to choose which runtime var to use for snippets
+    moduleExportRanges: [number, number][] = []
+    moduleExportNames: Set<string> = new Set() // to choose which runtime var to use for snippets
 
     mixedVisitor: MixedVisitor<MixedNodesTypes>
 
@@ -160,7 +171,11 @@ export class SvelteTransformer extends Transformer<RuntimeCtxSv> {
             useComponent: this.currentElement !== 'title',
         })
 
-    visitRegularElement = (node: AST.ElementLike): Message[] => {
+    visitElementLike = (node: {
+        name: string
+        attributes: (AST.AttributeLike | AST.AttachTag)[]
+        fragment: AST.Fragment
+    }): Message[] => {
         const currentElement = this.currentElement
         this.currentElement = node.name
         const msgs: Message[] = []
@@ -172,7 +187,20 @@ export class SvelteTransformer extends Transformer<RuntimeCtxSv> {
         return msgs
     }
 
+    visitRegularElement = (node: AST.ElementLike): Message[] => this.visitElementLike(node)
+
     visitComponent = this.visitRegularElement
+
+    visitSlotElement = (node: AST.SlotElement): Message[] => this.visitElementLike(node)
+
+    visitSvelteFragment = (node: AST.SvelteFragment): Message[] => this.visitElementLike(node)
+
+    visitSvelteSelf = (node: AST.SvelteSelf): Message[] => this.visitElementLike(node)
+
+    visitSvelteComponent = (node: AST.SvelteComponent): Message[] => [
+        ...this.visit(node.expression as AnyNode),
+        ...this.visitElementLike(node),
+    ]
 
     visitText = (node: AST.Text): Message[] => {
         const [startWh, trimmed, endWh] = nonWhitespaceText(node.data)
@@ -249,11 +277,12 @@ export class SvelteTransformer extends Transformer<RuntimeCtxSv> {
         return this.visit(node.expression)
     }
 
+    visitHtmlTag = (node: AST.HtmlTag): Message[] => this.visit(node.expression as AnyNode)
+
     visitSnippetBlock = (node: AST.SnippetBlock): Message[] => {
         // use module runtime var because the snippet may be exported from the module
         const prevRtVar = this.currentRtVar
-        const pattern = new RegExp(`\\b${node.expression.name}\\b`)
-        if (this.moduleExportRanges.some(([start, end]) => pattern.test(this.content.slice(start, end)))) {
+        if (this.moduleExportNames.has(node.expression.name)) {
             this.currentRtVar = rtModuleVar
         }
         const msgs = this.visitFragment(node.body)
@@ -301,9 +330,48 @@ export class SvelteTransformer extends Transformer<RuntimeCtxSv> {
 
     visitSvelteBody = (node: AST.SvelteBody): Message[] => node.attributes.flatMap(this.visitSv)
 
+    visitDirectiveExpr = (expr?: AnyNode | AST.ExpressionTag | null): Message[] => {
+        if (!expr) {
+            return []
+        }
+        if (expr.type === 'ExpressionTag') {
+            expr = expr.expression as AnyNode
+        }
+        return this.visit(expr)
+    }
+
+    visitOnDirective = (node: AST.OnDirective): Message[] => this.visitDirectiveExpr(node.expression as AnyNode | null)
+
+    visitUseDirective = (node: AST.UseDirective): Message[] => this.visitDirectiveExpr(node.expression as AnyNode | null)
+
+    visitClassDirective = (node: AST.ClassDirective): Message[] => this.visitDirectiveExpr(node.expression as AnyNode | null)
+
+    visitStyleDirective = (node: AST.StyleDirective): Message[] => {
+        if (node.value === true) {
+            return []
+        }
+        if (Array.isArray(node.value)) {
+            return node.value.flatMap(value => (value.type === 'ExpressionTag' ? this.visitDirectiveExpr(value) : []))
+        }
+        return this.visitDirectiveExpr(node.value)
+    }
+
+    visitTransitionDirective = (node: AST.TransitionDirective): Message[] =>
+        this.visitDirectiveExpr(node.expression as AnyNode | null)
+
+    visitAnimateDirective = (node: AST.AnimateDirective): Message[] =>
+        this.visitDirectiveExpr(node.expression as AnyNode | null)
+
+    visitBindDirective = (node: AST.BindDirective): Message[] => this.visitDirectiveExpr(node.expression as AnyNode | null)
+
+    visitLetDirective = (node: AST.LetDirective): Message[] => this.visitDirectiveExpr(node.expression as AnyNode | null)
+
     visitSvelteDocument = (node: AST.SvelteDocument): Message[] => node.attributes.flatMap(this.visitSv)
 
-    visitSvelteElement = (node: AST.SvelteElement): Message[] => node.attributes.flatMap(this.visitSv)
+    visitSvelteElement = (node: AST.SvelteElement): Message[] => [
+        ...this.visit(node.tag as AnyNode),
+        ...this.visitElementLike(node),
+    ]
 
     visitSvelteBoundary = (node: AST.SvelteBoundary): Message[] => [
         ...node.attributes.flatMap(this.visitSv),
@@ -346,16 +414,36 @@ export class SvelteTransformer extends Transformer<RuntimeCtxSv> {
 
     visitSv = (node: AST.SvelteNode | AnyNode): Message[] => this.visit(node as AnyNode)
 
-    /** collects the ranges that will be checked if a snippet identifier is exported using RegExp test to simplify */
-    collectModuleExportRanges = (script: AST.Script) => {
+    collectIdentifiers = (node: unknown) => {
+        if (!node || typeof node !== 'object') {
+            return
+        }
+        if (Array.isArray(node)) {
+            for (const child of node) {
+                this.collectIdentifiers(child)
+            }
+            return
+        }
+        const childNode = node as { type?: string; name?: string; [key: string]: unknown }
+        if (childNode.type === 'Identifier' && childNode.name) {
+            this.moduleExportNames.add(childNode.name)
+        }
+        for (const [key, value] of Object.entries(childNode)) {
+            if (key === 'start' || key === 'end' || key.endsWith('_loc')) {
+                continue
+            }
+            this.collectIdentifiers(value)
+        }
+    }
+
+    collectModuleExportNames = (script: AST.Script) => {
         for (const stmt of script.content.body) {
             if (stmt.type !== 'ExportNamedDeclaration') {
                 continue
             }
             for (const spec of stmt.specifiers) {
                 if (spec.local.type === 'Identifier') {
-                    const local = spec.local as Identifier
-                    this.moduleExportRanges.push([local.start, local.end])
+                    this.moduleExportNames.add((spec.local as Identifier).name)
                 }
             }
             const declaration = stmt.declaration as Declaration
@@ -364,6 +452,7 @@ export class SvelteTransformer extends Transformer<RuntimeCtxSv> {
             }
             if (declaration.type === 'FunctionDeclaration' || declaration.type === 'ClassDeclaration') {
                 this.moduleExportRanges.push([declaration.start, declaration.end])
+                this.collectIdentifiers(declaration)
                 continue
             }
             for (const decl of declaration?.declarations ?? []) {
@@ -372,6 +461,7 @@ export class SvelteTransformer extends Transformer<RuntimeCtxSv> {
                 }
                 this.moduleExportRanges.push([decl.init.start, decl.init.end])
             }
+            this.collectIdentifiers(declaration)
         }
     }
 
@@ -387,7 +477,7 @@ export class SvelteTransformer extends Transformer<RuntimeCtxSv> {
         this.mstr = new MagicString(this.content)
         this.mixedVisitor = this.initMixedVisitor()
         if (ast.type === 'Root' && ast.module) {
-            this.collectModuleExportRanges(ast.module)
+            this.collectModuleExportNames(ast.module)
         }
         const msgs = this.visitSv(ast)
         const initRuntime = this.initRuntime()
